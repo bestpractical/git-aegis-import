@@ -1,0 +1,219 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use File::Temp;
+use File::Spec;
+use File::Path;
+use Git;
+
+my %opt;
+GetOptions(
+    \%opt,
+    "project|p=s",
+    "authors-file|authors|A=s",
+    "rights-file|rights|r=s",
+    "output|o=s",
+    "branch|b=s",
+    "force|f!",
+) or pod2usage;
+
+pod2usage("No project given!") unless $opt{project};
+pod2usage("No authors-file given!") unless $opt{"authors-file"};
+
+# Attempt to parse branch out of the project name
+if (not defined $opt{branch} and $opt{project} =~ s/^(.*?)\.(\d+(\.\d+)*$)/$1/) {
+    $opt{branch} = $2;
+}
+
+warn "No branch given, assuming 1.0\n"
+    unless defined $opt{branch};
+$opt{branch} = "1.0" unless defined $opt{branch};
+
+warn "No output directory given, assuming $opt{project}.git\n"
+    unless defined $opt{output};
+$opt{output} = "$opt{project}.git" unless defined $opt{output};
+
+# Load up our authors, rights, and deltas
+my %authors = load_authors($opt{"authors-file"});
+my %chmod   = load_rights($opt{"rights-file"});
+my @deltas  = load_deltas(%opt);
+
+# Make our output dir
+$opt{output} = File::Spec->rel2abs($opt{output});
+if (-e $opt{output}) {
+    if ($opt{force}) {
+        rmtree($opt{output});
+    } else {
+        die "Output directory $opt{output} already exists!\n"
+            ."Remove or re-run with -f to overwrite\n";
+    }
+}
+$ENV{GIT_DIR} = $opt{output};
+Git::command("init");
+
+for my $delta (@deltas) {
+    # Check out a temporary snapshot
+    my $dir = File::Temp::tempdir( CLEANUP => 1 );
+    chdir $dir;
+    !system("aegis -cp -ind -del ".$delta->{delta}." -p $opt{project} -br $opt{branch} . > /dev/null")
+        or die "Can't check out aegis delta @{[$delta->{delta}]} from branch $opt{branch} of project $opt{project}!\n";
+    unlink "aegis.log";
+    chmod oct($chmod{$_}), $_ for keys %chmod;
+
+    # Set us up the variables
+    $ENV{GIT_WORK_TREE} = $dir;
+    $ENV{GIT_AUTHOR_NAME}     = $authors{$delta->{author}}{name};
+    $ENV{GIT_AUTHOR_EMAIL}    = $authors{$delta->{author}}{email};
+    $ENV{GIT_COMMITTER_NAME}  = $authors{$delta->{committer}}{name};
+    $ENV{GIT_COMMITTER_EMAIL} = $authors{$delta->{committer}}{email};
+    $ENV{GIT_AUTHOR_DATE} = $ENV{GIT_COMMITTER_DATE} = $delta->{date} if $delta->{date};
+
+    # Check it in, and tag if need be
+    my $git = Git->repository( WorkingCopy => $dir => Repository => $opt{output} );
+    $git->command( add => "-A" => $dir );
+    eval { $git->command( commit => "-m", $delta->{message}); }; # Can fail on first commit
+    $git->command( tag => $delta->{tag} ) if $delta->{tag};
+}
+
+# Loads a file in the same format as 'git svn' or 'git cvsimport'
+# uses, and stows it in %authors
+sub load_authors {
+    my $filename = shift;
+
+    my %authors;
+    open(my $authors, $filename) or die "Can't open authors file $filename: $!";
+    while (<$authors>) {
+        chomp;
+        /^(\S+)\s*=\s*(.*?)\s*<(.*?)>/ and $authors{$1} = {name => $2, email => $3};
+    }
+    close $authors;
+    $authors{aegis} = $authors{root};
+    return %authors;
+}
+
+# Loads a file giving rights; it's not an error if no file is given
+sub load_rights {
+    my $filename = shift;
+    return () unless defined $filename;
+
+    my %chmod;
+    open(my $chmod, $filename) or die "Can't open rights file $filename: $!";
+    while (<$chmod>) {
+        chomp;
+        /^(0\d+)\s+(.*)/ and $chmod{$2} = $1;
+    }
+    close $chmod;
+    return %chmod;
+}
+
+# Go looking for what deltas we need to load, parsing out commit
+# messages, authors, and committers.
+sub load_deltas {
+    my %opt = @_;
+
+    # Look up the project and branch; if this dies, so should we
+    my @lines = `aegis -l project-history -unf -p $opt{project}.$opt{branch}`;
+    exit($? >> 8) if $?;
+
+    my $tag;
+    my $i = 0;    
+    my @deltas = ({delta => 0, message => "Delta 0", author => "aegis", committer => "aegis"});
+
+    for (@lines) {
+        print "\rParsing deltas: $i/@{[scalar @lines]}"; $i++;
+        # The 'Name: "...."' line proceeds the commit which is the release
+        if (/^Name: "(.*)"/) {
+            $tag = $1;
+        } elsif (/^(\d+) (\S+ \S+\s+\d+ \d+:\d+:\d+ \d+) (\d+)/) {
+            # delta number, commit time, change number
+            push @deltas, {delta => $1, date => $2, change => $3};
+            if ($tag) {
+                # If this was tagged on the previous line, record it
+                $deltas[-1]{tag} = $tag;
+                undef $tag;
+            }
+
+            # Describing the change gets the author and committer
+            my $describe = `aegis -l cd -del $1 -p $opt{project}.$opt{branch}`;
+            $describe =~ /^HISTORY\n\tDeveloped by (\w+)\..*?Integrated by (\w+)\./m or die "Can't extract authors!\n$describe";
+            die "Missing author: $1 in delta $deltas[-1]{delta}\n" unless $authors{$1};
+            die "Missing committer: $2 in delta $deltas[-1]{delta}\n" unless $authors{$2};
+            $deltas[-1]{author} = $1;
+            $deltas[-1]{committer} = $2;
+
+            # Parse the SUMMARY for the commit message
+            my ($message) = $describe =~ /^SUMMARY\n((?:\t.*?\n)+)/m or die "Can't extract message!";
+            $message =~ s/^\t//mg;
+            $message =~ s/^\s*//; $message =~ s/\s*$//;
+            $message =~ s/\n/\n\n/;
+            $deltas[-1]{message} = $message;
+        }
+    }
+    print "\n";
+    return @deltas;
+}
+
+__END__
+
+=head1 NAME
+
+git-aegis-import - Convert aegis repositories to git
+
+=head1 SYNOPSIS
+
+  git aegis-import --project Project --authors authors.txt
+
+=head1 DESCRIPTION
+
+C<git aegis-import> imports commits from an Aegis
+(L<http://aegis.sourceforge.net/>) project.  It creates a new bare
+repository with all of the revisions of the Aegis repository; it is
+not capable of propagating updates in either direction.
+
+=head1 OPTIONS
+
+=over
+
+=item B<--project> or B<-p>
+
+Required; the name of the project in Aegis to convert.
+
+=item B<--authors-file>, B<--authors>, or B<-a>
+
+Required; the path to a file (compatible with C<git svn> or C<git
+cvsimport>) which associates usernames with their names and email
+addresses.  The format is:
+
+    loginname = Joe User <user@example.com>
+
+C<git aegis-import> will die if it encounters a username which is not
+present in the file.
+
+=item C<--rights-file>, B<--rights>, or B<-r>
+
+Optional; a file which describes permissions that files should have
+when they are imported into the repository, as Aegis does not track
+this.  The format is:
+
+    0755 path/to/some/file
+
+=item B<--output> or B<-o>
+
+The path to the repository which is created; defaults to
+C<< I<project>.git >>
+
+=item B<--branch> or B<-b>
+
+The branch of the project to convert.  Defaults to 1.0 if not given,
+and cannot be extracted from the project name.
+
+=item B<--force> or B<-f>
+
+Overwrites the output directory if it already exists.
+
+=back
+
+=cut
